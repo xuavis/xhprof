@@ -16,8 +16,6 @@
  */
 // Define  _DEBUGOUTPUT to enable various debug output
 //#define _DEBUGOUTPUT
-// Define DONTKNOWWHY to enable code how it probably should be, but for some reason doesn't work
-//#define DONTKNOWWHY
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -1208,13 +1206,8 @@ void hp_inc_count(zval *counts, char *name, long count TSRMLS_DC) {
   void *data;
 
   if (!counts) return;
-#ifdef DONTKNOWWHY
-  // HASH_OF changes type/u1 of counts!?
   ht = HASH_OF(counts);
-#else
-  ht = counts->value.arr;
-#endif
-  
+
   if (!ht) {
 #ifdef _DEBUGOUTPUT
 	debug_output("No counts to increase: %s\n", name);
