@@ -298,11 +298,8 @@ static void get_all_cpu_frequencies();
 static long get_us_interval(struct timeval *start, struct timeval *end);
 static void incr_us_interval(struct timeval *start, uint64 incr);
 
-#if PHP_VERSION_ID < 70000
 static void hp_get_ignored_functions_from_arg(zval *args);
-#else //removed zval *args because of memory leak
-static void hp_get_ignored_functions_from_arg();
-#endif
+
 static void hp_ignored_functions_filter_clear();
 static void hp_ignored_functions_filter_init();
 
@@ -313,6 +310,13 @@ static inline void   hp_array_del(char **name_array);
 #ifdef _DEBUGOUTPUT
 static void debug_output(const char *format, ...);
 #endif
+#if PHP_VERSION_ID >= 70000
+ZEND_DLEXPORT void ht_function_handler(INTERNAL_FUNCTION_PARAMETERS);
+ZEND_DLEXPORT void hp_execute_ex(zend_execute_data *execute_data);
+#endif
+ZEND_DLEXPORT zend_op_array* hp_compile_file(zend_file_handle *file_handle, int type TSRMLS_DC);
+ZEND_DLEXPORT zend_op_array* hp_compile_string(zval *source_string, char *filename TSRMLS_DC);
+void hp_mode_sampled_endfn_cb(hp_entry_t **entries  TSRMLS_DC);
 
 /* {{{ arginfo */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_xhprof_enable, 0, 0, 0)
@@ -403,20 +407,19 @@ PHP_INI_BEGIN()
 	  */
 	PHP_FUNCTION(xhprof_enable) {
 	long  xhprof_flags = 0;                                    /* XHProf flags */
-#if PHP_VERSION_ID < 70000 // removed because of memory leak
 	zval *optional_array = NULL; // optional array arg: for future use
-#endif
+
 	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|lz", &xhprof_flags
-#if PHP_VERSION_ID < 70000
+
 		, &optional_array
-#endif
+
 		) == FAILURE) {
 		return;
 	}
-#if PHP_VERSION_ID < 70000  
-	hp_get_ignored_functions_from_arg(&optional_array));
+#if PHP_VERSION_ID >= 70000
+	hp_get_ignored_functions_from_arg(optional_array);
 #else
-	hp_get_ignored_functions_from_arg();
+	hp_get_ignored_functions_from_arg(&optional_array);
 #endif
 	hp_begin(XHPROF_MODE_HIERARCHICAL, xhprof_flags TSRMLS_CC);
 }
@@ -449,11 +452,7 @@ PHP_FUNCTION(xhprof_disable) {
  */
 PHP_FUNCTION(xhprof_sample_enable) {
 	long  xhprof_flags = 0;                                    /* XHProf flags */
-#if PHP_VERSION_ID >= 70000 
-	hp_get_ignored_functions_from_arg();
-#else
 	hp_get_ignored_functions_from_arg(NULL);
-#endif
 	hp_begin(XHPROF_MODE_SAMPLED, xhprof_flags TSRMLS_CC);
 }
 
@@ -551,10 +550,44 @@ PHP_MSHUTDOWN_FUNCTION(xhprof) {
 	return SUCCESS;
 }
 
+void update_functions()
+{
+	HashTable *table = EG(function_table);
+	ulong num_key;
+	zend_string *key;
+	zval *val;
+	ZEND_HASH_FOREACH_KEY_VAL(table, num_key, key, val) {
+
+		if (!zend_hash_exists(hp_globals.orig_functions, key)) {
+#ifdef _DEBUGOUTPUT
+			debug_output("Replacing function: %s\n", key->val);
+#endif
+			zval tmp;
+			zend_hash_add_new_ptr(hp_globals.orig_functions, key, Z_FUNC_P(val)->internal_function.handler);
+			Z_FUNC_P(val)->internal_function.handler = ht_function_handler;
+		}
+	} ZEND_HASH_FOREACH_END();
+}
+
 /**
  * Request init callback. Nothing to do yet!
  */
 PHP_RINIT_FUNCTION(xhprof) {
+#if PHP_VERSION_ID >= 70000
+	ALLOC_HASHTABLE(hp_globals.orig_functions);
+	zend_hash_init(hp_globals.orig_functions, 2048, NULL, NULL, 0);
+	update_functions();
+	/* Replace zend_compile with our proxy */
+	_zend_compile_file = zend_compile_file;
+	zend_compile_file = hp_compile_file;
+
+	/* Replace zend_compile_string with our proxy */
+	_zend_compile_string = zend_compile_string;
+	zend_compile_string = hp_compile_string;
+
+	_zend_execute_ex = zend_execute_ex;
+	zend_execute_ex = hp_execute_ex;
+#endif
 	return SUCCESS;
 }
 
@@ -766,7 +799,6 @@ void hp_clean_profiler_state(TSRMLS_D) {
 
 	/* Clear globals */
 	if (!Z_ISUNDEF(hp_globals.stats_count)) {
-		//zval_dtor(&hp_globals.stats_count);
 		ZVAL_UNDEF(&hp_globals.stats_count);
 	}
 	hp_globals.entries = NULL;
@@ -793,9 +825,9 @@ void hp_clean_profiler_state(TSRMLS_D) {
     profile_curr = !hp_ignore_entry(hash_code, symbol);                 \
     if (profile_curr) {                                                 \
       hp_entry_t *cur_entry = hp_fast_alloc_hprof_entry();              \
-      (cur_entry)->hash_code = hash_code;                               \
-      (cur_entry)->name_hprof = symbol;                                 \
-      (cur_entry)->prev_hprof = (*(entries));                           \
+      cur_entry->hash_code = hash_code;                                 \
+      cur_entry->name_hprof = symbol;                                   \
+      cur_entry->prev_hprof = (*(entries));                             \
       /* Call the universal callback */                                 \
       hp_mode_common_beginfn((entries), (cur_entry) TSRMLS_CC);         \
       /* Call the mode's beginfn callback */                            \
@@ -1013,7 +1045,7 @@ static char *hp_get_function_name(zend_execute_data *data) {
 		if (curr_func->common.function_name != NULL) {
 			func = curr_func->common.function_name->val;
 #else
-		curr_func = data->function_sate.function;
+		curr_func = data->function_state.function;
 		func = curr_func->common.function_name;
 		if (func) {
 #endif
@@ -1864,64 +1896,77 @@ ZEND_DLEXPORT void hp_execute_ex(zend_execute_data *execute_data) {
 #endif
 	char          *func = NULL;
 	int hp_profile_flag = 1;
+	if (hp_globals.enabled) {
 #if PHP_VERSION_ID < 70000
-	func = hp_get_function_name(ops TSRMLS_CC);
-	if (!func) {
+		func = hp_get_function_name(ops TSRMLS_CC);
+		if (!func) {
+#if PHP_VERSION_ID < 50500
+			_zend_execute(ops TSRMLS_CC);
+#else
+			_zend_execute_ex(execute_data TSRMLS_CC);
+#endif
+			if (execute_data->opline == NULL) {
+				return;
+			}
+		}
+
+		BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
 #if PHP_VERSION_ID < 50500
 		_zend_execute(ops TSRMLS_CC);
 #else
 		_zend_execute_ex(execute_data TSRMLS_CC);
 #endif
-		if (execute_data->opline == NULL) {
+		if (hp_globals.entries) {
+			END_PROFILING(&hp_globals.entries, hp_profile_flag);
+		}
+		efree(func);
+#else
+		zend_execute_data *data;
+		data = EG(current_execute_data);
+		func = hp_get_function_name(data);
+		if (!func) {
+#ifdef _DEBUGOUTPUT
+			debug_output("no func\n");
+#endif
+			_zend_execute_ex(execute_data);
 			return;
 		}
+#if PHP_VERSION_ID >= 70000
+		if (data->func->type == ZEND_INTERNAL_FUNCTION) {
+#ifdef _DEBUGOUTPUT			
+			debug_output("Skipping internal function %s\n", func);
+#endif
+			_zend_execute_ex(execute_data);
+			return;
+		}
+#endif
+#ifdef _DEBUGOUTPUT
+		debug_output("hp_execute_ex%s\n", func);
+		debug_output("begin profiling %s\n", func);
+#endif
+		BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
+#ifdef _DEBUGOUTPUT
+		debug_output("done begin profiling %s\n", func);
+#endif
 	}
-
-	BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
 #if PHP_VERSION_ID < 50500
 	_zend_execute(ops TSRMLS_CC);
 #else
 	_zend_execute_ex(execute_data TSRMLS_CC);
 #endif
-	if (hp_globals.entries) {
-		END_PROFILING(&hp_globals.entries, hp_profile_flag);
-	}
-	efree(func);
-#else
-	zend_execute_data *data;
-	data = EG(current_execute_data);
-	func = hp_get_function_name(data);
-	if (!func) {
+	if (hp_globals.enabled) {
+		if (hp_globals.entries) {
 #ifdef _DEBUGOUTPUT
-		debug_output("no func\n");
+			debug_output("end profiling %s\n", func);
 #endif
-		_zend_execute_ex(execute_data);
-		return;
-	}
+			END_PROFILING(&hp_globals.entries, hp_profile_flag);
 #ifdef _DEBUGOUTPUT
-	debug_output("hp_execute_ex%s\n", func);
-	debug_output("begin profiling %s\n", func);
-#endif
-	BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
-#ifdef _DEBUGOUTPUT
-	debug_output("done begin profiling %s\n", func);
-#endif
-#if PHP_VERSION_ID < 50500
-	_zend_execute(ops TSRMLS_CC);
-#else
-	_zend_execute_ex(execute_data TSRMLS_CC);
-#endif
-	if (hp_globals.entries) {
-#ifdef _DEBUGOUTPUT
-		debug_output("end profiling %s\n", func);
-#endif
-		END_PROFILING(&hp_globals.entries, hp_profile_flag);
-#ifdef _DEBUGOUTPUT
-		debug_output("done end profiling %s\n", func);
+			debug_output("done end profiling %s\n", func);
 #endif
 
+		}
+		efree(func);
 	}
-	efree(func);
 
 #endif
 }
@@ -1952,19 +1997,29 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data, zval *re
 	zend_execute_data *current_data;
 	char             *func = NULL;
 	int    hp_profile_flag = 1;
-
+	int     should_profile = 1;
 	current_data = EG(current_execute_data);
 #if PHP_VERSION_ID < 70000
 	func = hp_get_function_name(current_data->op_array TSRMLS_CC);
 #else
 	func = hp_get_function_name(current_data);
 #endif
+#if PHP_VERSION_ID >= 70000
+	if (current_data->func->type == ZEND_INTERNAL_FUNCTION) {
+#ifdef _DEBUGOUTPUT			
+		debug_output("Skipping internal function %s\n", func);
+#endif
+		should_profile = 0;
+	}
+#endif
 
 	if (func) {
 #ifdef _DEBUGOUTPUT
 		debug_output("hp_execute_internal: %s\n", func);
 #endif
-		BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
+		if (should_profile) {
+			BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);			
+		}
 	}
 
 	if (!_zend_execute_internal) {
@@ -2025,7 +2080,7 @@ ZEND_DLEXPORT void hp_execute_internal(zend_execute_data *execute_data, zval *re
 	}
 
 	if (func) {
-		if (hp_globals.entries) {
+		if (hp_globals.entries && should_profile) {
 			END_PROFILING(&hp_globals.entries, hp_profile_flag);
 		}
 		efree(func);
@@ -2046,31 +2101,36 @@ ZEND_DLEXPORT zend_op_array* hp_compile_file(zend_file_handle *file_handle,
 	int             len;
 	zend_op_array  *ret;
 	int             hp_profile_flag = 1;
-
-	filename = hp_get_base_filename(file_handle->filename);
-	len = strlen("load") + strlen(filename) + 3;
-	func = (char *)emalloc(len);
-	snprintf(func, len, "load::%s", filename);
+	if (hp_globals.enabled) {
+		filename = hp_get_base_filename(file_handle->filename);
+		len = strlen("load") + strlen(filename) + 3;
+		func = (char *)emalloc(len);
+		snprintf(func, len, "load::%s", filename);
 #ifdef _DEBUGOUTPUT
-	debug_output("hp_compile_file %s\n", func);
-	debug_output("begin profiling %s\n", func);
+		debug_output("hp_compile_file %s\n", func);
+		debug_output("begin profiling %s\n", func);
 #endif
-	BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
+		BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
 #ifdef _DEBUGOUTPUT
-	debug_output("done begin profiling %s\n", func);
-#endif
-	ret = _zend_compile_file(file_handle, type TSRMLS_CC);
-	if (hp_globals.entries) {
-#ifdef _DEBUGOUTPUT
-		debug_output("end profiling %s\n", func);
-#endif
-		END_PROFILING(&hp_globals.entries, hp_profile_flag);
-#ifdef _DEBUGOUTPUT
-		debug_output("done end profiling %s\n", func);
+		debug_output("done begin profiling %s\n", func);
 #endif
 	}
+	ret = _zend_compile_file(file_handle, type TSRMLS_CC);
+	if (hp_globals.enabled) {
+		if (hp_globals.entries) {
+#ifdef _DEBUGOUTPUT
+			debug_output("end profiling %s\n", func);
+#endif
+			END_PROFILING(&hp_globals.entries, hp_profile_flag);
+#ifdef _DEBUGOUTPUT
+			debug_output("done end profiling %s\n", func);
+#endif
+		}
+		efree(func);
+	}
+	update_functions();
 
-	efree(func);
+
 	return ret;
 }
 
@@ -2103,14 +2163,23 @@ ZEND_DLEXPORT void ht_function_handler(INTERNAL_FUNCTION_PARAMETERS) {
 	HashTable *ht = hp_globals.orig_functions;
 	zend_string *function_name = execute_data->func->common.function_name;
 #ifdef _DEBUGOUTPUT
-	debug_output("func: %s\n", function_name->val);
+	debug_output("function_handler: %s\n", function_name->val);
 #endif
 	int hp_profile_flag = 1;
-	BEGIN_PROFILING(&hp_globals.entries, function_name->val, hp_profile_flag);
+	int enabled = hp_globals.enabled;
+	int should_profile = 1;
+	if (hp_globals.xhprof_flags & XHPROF_FLAGS_NO_BUILTINS && execute_data->func->type == ZEND_INTERNAL_FUNCTION) {
+		should_profile = 0;
+	}
 	void(*handler)(INTERNAL_FUNCTION_PARAMETERS) = zend_hash_find_ptr(ht, function_name);
+	if (enabled && should_profile) {
+		BEGIN_PROFILING(&hp_globals.entries, function_name->val, hp_profile_flag);
+	}	
 	handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
-	if (hp_globals.entries) {
-		END_PROFILING(&hp_globals.entries, hp_profile_flag);
+	if (enabled) {
+		if (hp_globals.entries && should_profile) {
+			END_PROFILING(&hp_globals.entries, hp_profile_flag);
+		}
 	}
 }
 #endif
@@ -2133,6 +2202,15 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC) {
 		hp_globals.enabled = 1;
 		hp_globals.xhprof_flags = (uint32)xhprof_flags;
 
+		/* Replace zend_execute with our proxy */
+#if PHP_VERSION_ID < 50500
+		_zend_execute = zend_execute;
+		zend_execute = hp_execute;
+#elseif PHP_VERSION_ID < 70000
+		_zend_execute_ex = zend_execute_ex;
+		zend_execute_ex = hp_execute_ex;
+#endif
+#if PHP_VERSION_ID < 70000
 		/* Replace zend_compile with our proxy */
 		_zend_compile_file = zend_compile_file;
 		zend_compile_file = hp_compile_file;
@@ -2140,14 +2218,6 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC) {
 		/* Replace zend_compile_string with our proxy */
 		_zend_compile_string = zend_compile_string;
 		zend_compile_string = hp_compile_string;
-
-		/* Replace zend_execute with our proxy */
-#if PHP_VERSION_ID < 50500
-		_zend_execute = zend_execute;
-		zend_execute = hp_execute;
-#else
-		_zend_execute_ex = zend_execute_ex;
-		zend_execute_ex = hp_execute_ex;
 #endif
 
 		/* Replace zend_execute_internal with our proxy */
@@ -2179,19 +2249,7 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC) {
 			hp_globals.mode_cb.end_fn_cb = hp_mode_sampled_endfn_cb;
 			break;
 		}
-#if PHP_VERSION_ID >= 70000
-		ALLOC_HASHTABLE(hp_globals.orig_functions);
-		zend_hash_init(hp_globals.orig_functions, 2048, NULL, zend_function_dtor, 0);
-		HashTable *table = EG(function_table);
-		ulong num_key;
-		zend_string *key;
-		zval *val;
-		ZEND_HASH_FOREACH_KEY_VAL(table, num_key, key, val) {
-			zval tmp;
-			zend_hash_add_new_ptr(hp_globals.orig_functions, key, Z_FUNC_P(val)->internal_function.handler);
-			Z_FUNC_P(val)->internal_function.handler = ht_function_handler;
-		} ZEND_HASH_FOREACH_END();
-#endif
+
 		/* one time initializations */
 		hp_init_profiler_state(level TSRMLS_CC);
 
@@ -2216,6 +2274,23 @@ static void hp_end(TSRMLS_D) {
 
 	/* Clean up state */
 	hp_clean_profiler_state(TSRMLS_C);
+
+	HashTable *table = EG(function_table);
+	ulong num_key;
+	zend_string *key;
+	zval *val;
+	ZEND_HASH_FOREACH_KEY_VAL(hp_globals.orig_functions, num_key, key, val) {
+		zval *tmp = zend_hash_find(EG(function_table), key);
+		Z_FUNC_P(tmp)->internal_function.handler = Z_PTR_P(val);
+	} ZEND_HASH_FOREACH_END();
+	zend_hash_destroy(hp_globals.orig_functions);
+	FREE_HASHTABLE(hp_globals.orig_functions);
+	hp_globals.orig_functions = NULL;
+#if PHP_VERSION_ID < 70000
+	zend_compile_file = _zend_compile_file;
+	zend_compile_string = _zend_compile_string;
+	zend_execute_ex = _zend_execute_ex;
+#endif
 }
 
 /**
@@ -2233,21 +2308,14 @@ static void hp_stop(TSRMLS_D) {
 	/* Remove proxies, restore the originals */
 #if PHP_VERSION_ID < 50500
 	zend_execute = _zend_execute;
-#else
+#elseif PHP_VERSION_ID < 70000
 	zend_execute_ex = _zend_execute_ex;
 #endif
 	zend_execute_internal = _zend_execute_internal;
+#if PHP_VERSION_ID < 70000
 	zend_compile_file = _zend_compile_file;
 	zend_compile_string = _zend_compile_string;
-
-	HashTable *table = EG(function_table);
-	ulong num_key;
-	zend_string *key;
-	zval *val;
-	ZEND_HASH_FOREACH_KEY_VAL(hp_globals.orig_functions, num_key, key, val) {
-		zval *tmp = zend_hash_find(EG(function_table), key);
-		Z_FUNC_P(tmp)->internal_function.handler = Z_PTR_P(val);
-	} ZEND_HASH_FOREACH_END();
+#endif
 	/* Resore cpu affinity. */
 	restore_cpu_affinity(&hp_globals.prev_mask);
 
