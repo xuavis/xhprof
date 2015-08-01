@@ -193,7 +193,7 @@ foo==>strpos                            : ct=       1; wt=*;
 main()                                  : ct=       1; wt=*;
 main()==>test_call_user_func::__construct: ct=       1; wt=*;
 main()==>xhprof_disable                 : ct=       1; wt=*;
-test_call_user_func::__construct==>foo: ct=       1; wt=*;
+test_call_user_func::__construct==>foo  : ct=       1; wt=*;
 
 Part 2b: Standard profile without parameters
 hello: user_func test

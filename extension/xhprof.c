@@ -2262,18 +2262,6 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC) {
  * Called at request shutdown time. Cleans the profiler's global state.
  */
 static void hp_end(TSRMLS_D) {
-	/* Bail if not ever enabled */
-	if (!hp_globals.ever_enabled) {
-		return;
-	}
-
-	/* Stop profiler if enabled */
-	if (hp_globals.enabled) {
-		hp_stop(TSRMLS_C);
-	}
-
-	/* Clean up state */
-	hp_clean_profiler_state(TSRMLS_C);
 
 	HashTable *table = EG(function_table);
 	ulong num_key;
@@ -2286,6 +2274,22 @@ static void hp_end(TSRMLS_D) {
 	zend_hash_destroy(hp_globals.orig_functions);
 	FREE_HASHTABLE(hp_globals.orig_functions);
 	hp_globals.orig_functions = NULL;
+	/* Bail if not ever enabled */
+	if (!hp_globals.ever_enabled) {
+		return;
+	}
+
+	/* Clean up state */
+	hp_clean_profiler_state(TSRMLS_C);
+
+	/* Stop profiler if enabled */
+	if (hp_globals.enabled) {
+		hp_stop(TSRMLS_C);
+	}
+
+
+
+
 #if PHP_VERSION_ID < 70000
 	zend_compile_file = _zend_compile_file;
 	zend_compile_string = _zend_compile_string;
