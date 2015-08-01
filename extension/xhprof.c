@@ -798,8 +798,8 @@ void hp_clean_profiler_state(TSRMLS_D) {
 	hp_globals.mode_cb.exit_cb(TSRMLS_C);
 
 	/* Clear globals */
-	if (!Z_ISUNDEF(hp_globals.stats_count)) {
-		ZVAL_UNDEF(&hp_globals.stats_count);
+	if (hp_globals.enabled && !Z_ISUNDEF(hp_globals.stats_count)) {
+		zval_dtor(&hp_globals.stats_count);
 	}
 	hp_globals.entries = NULL;
 	hp_globals.profiler_level = 1;

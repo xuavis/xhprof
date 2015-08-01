@@ -5,5 +5,5 @@ To view the latest version of the doc, go to:
   http://pecl.php.net/package/xhprof ---> [View Documentation]
 
 PHP 7 status:
-  + Seems to work, need to test more though
-  - It has memory leaks when not calling xhprof_disable() after calling xhprof_enable()
++ Seems to work, needs performance testing
+- Doesn't work for the following function due to them being replaced by zend_compile at compile time: strlen, call_user_func*, 
