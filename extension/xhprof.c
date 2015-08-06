@@ -15,7 +15,7 @@
  *
  */
  // Define  _DEBUGOUTPUT to enable various debug output
- //#define _DEBUGOUTPUT
+// #define _DEBUGOUTPUT
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -556,15 +556,26 @@ void update_functions()
 	ulong num_key;
 	zend_string *key;
 	zval *val;
-	ZEND_HASH_FOREACH_KEY_VAL(table, num_key, key, val) {
+	zend_function *function;
 
-		if (!zend_hash_exists(hp_globals.orig_functions, key)) {
 #ifdef _DEBUGOUTPUT
-			debug_output("Replacing function: %s\n", key->val);
+	debug_output("updating functions\n");
 #endif
-			zval tmp;
-			zend_hash_add_new_ptr(hp_globals.orig_functions, key, Z_FUNC_P(val)->internal_function.handler);
-			Z_FUNC_P(val)->internal_function.handler = ht_function_handler;
+	ZEND_HASH_FOREACH_KEY_VAL(table, num_key, key, val) {
+		if (key->len > 0) {
+			function = Z_FUNC_P(val);
+			if (function->type != ZEND_INTERNAL_FUNCTION) {
+				continue;
+			}
+			if (!zend_hash_exists(hp_globals.orig_functions, key)) {
+
+#ifdef _DEBUGOUTPUT
+				debug_output("Replacing function: %s%i\n", key->val,key->len);
+#endif
+				zend_function *func = Z_FUNC_P(val);
+				zend_hash_add_new_ptr(hp_globals.orig_functions, key, function->internal_function.handler);
+				func->internal_function.handler = ht_function_handler;
+			}
 		}
 	} ZEND_HASH_FOREACH_END();
 }
@@ -573,7 +584,7 @@ void update_functions()
  * Request init callback. Nothing to do yet!
  */
 PHP_RINIT_FUNCTION(xhprof) {
-#if PHP_VERSION_ID >= 70000
+#if PHP_VERSION_ID >= 70000 // for php7 we need to replace all the current functions with our own. If not we'll not be able to profile correctly because zend_execute_ex is no longer called for every function.
 	ALLOC_HASHTABLE(hp_globals.orig_functions);
 	zend_hash_init(hp_globals.orig_functions, 2048, NULL, NULL, 0);
 	update_functions();
@@ -1147,8 +1158,12 @@ static char *hp_get_function_name(zend_execute_data *data) {
 				}
 			}
 			else if (search_type == 1) {
-				// not really sure if this is actually always create_function
-				func = "create_function";
+				if (curr_func->type == ZEND_EVAL_CODE) {
+					func = "eval";
+				} else {
+					// not really sure if this is actually always create_function (TODO: can also be an eval or a function created in eval or something...)
+					func = "create_function";
+				}
 			}
 
 
@@ -2101,7 +2116,8 @@ ZEND_DLEXPORT zend_op_array* hp_compile_file(zend_file_handle *file_handle,
 	int             len;
 	zend_op_array  *ret;
 	int             hp_profile_flag = 1;
-	if (hp_globals.enabled) {
+	int		enabled = hp_globals.enabled;
+	if (enabled) {
 		filename = hp_get_base_filename(file_handle->filename);
 		len = strlen("load") + strlen(filename) + 3;
 		func = (char *)emalloc(len);
@@ -2116,7 +2132,7 @@ ZEND_DLEXPORT zend_op_array* hp_compile_file(zend_file_handle *file_handle,
 #endif
 	}
 	ret = _zend_compile_file(file_handle, type TSRMLS_CC);
-	if (hp_globals.enabled) {
+	if (enabled) {
 		if (hp_globals.entries) {
 #ifdef _DEBUGOUTPUT
 			debug_output("end profiling %s\n", func);
@@ -2143,15 +2159,18 @@ ZEND_DLEXPORT zend_op_array* hp_compile_string(zval *source_string, char *filena
 	int            len;
 	zend_op_array *ret;
 	int            hp_profile_flag = 1;
-
+	int            enabled = hp_globals.enabled;
 	len = strlen("eval") + strlen(filename) + 3;
 	func = (char *)emalloc(len);
 	snprintf(func, len, "eval::%s", filename);
-
-	BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
+	if (enabled) {
+		BEGIN_PROFILING(&hp_globals.entries, func, hp_profile_flag);
+	}
 	ret = _zend_compile_string(source_string, filename TSRMLS_CC);
-	if (hp_globals.entries) {
-		END_PROFILING(&hp_globals.entries, hp_profile_flag);
+	if (enabled) {
+		if (hp_globals.entries) {
+			END_PROFILING(&hp_globals.entries, hp_profile_flag);
+		}
 	}
 
 	efree(func);
@@ -2206,7 +2225,7 @@ static void hp_begin(long level, long xhprof_flags TSRMLS_DC) {
 #if PHP_VERSION_ID < 50500
 		_zend_execute = zend_execute;
 		zend_execute = hp_execute;
-#elseif PHP_VERSION_ID < 70000
+#elif PHP_VERSION_ID < 70000
 		_zend_execute_ex = zend_execute_ex;
 		zend_execute_ex = hp_execute_ex;
 #endif
@@ -2274,6 +2293,12 @@ static void hp_end(TSRMLS_D) {
 	zend_hash_destroy(hp_globals.orig_functions);
 	FREE_HASHTABLE(hp_globals.orig_functions);
 	hp_globals.orig_functions = NULL;
+//#if PHP_VERSION_ID < 70000
+	zend_compile_file = _zend_compile_file;
+	zend_compile_string = _zend_compile_string;
+	zend_execute_ex = _zend_execute_ex;
+//#endif
+
 	/* Bail if not ever enabled */
 	if (!hp_globals.ever_enabled) {
 		return;
@@ -2290,11 +2315,6 @@ static void hp_end(TSRMLS_D) {
 
 
 
-#if PHP_VERSION_ID < 70000
-	zend_compile_file = _zend_compile_file;
-	zend_compile_string = _zend_compile_string;
-	zend_execute_ex = _zend_execute_ex;
-#endif
 }
 
 /**
@@ -2315,11 +2335,8 @@ static void hp_stop(TSRMLS_D) {
 #elseif PHP_VERSION_ID < 70000
 	zend_execute_ex = _zend_execute_ex;
 #endif
+
 	zend_execute_internal = _zend_execute_internal;
-#if PHP_VERSION_ID < 70000
-	zend_compile_file = _zend_compile_file;
-	zend_compile_string = _zend_compile_string;
-#endif
 	/* Resore cpu affinity. */
 	restore_cpu_affinity(&hp_globals.prev_mask);
 
